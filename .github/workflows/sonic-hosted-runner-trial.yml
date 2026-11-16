@@ -1,0 +1,259 @@
+# Hosted-runner SONiC trial — evidence gathering only.
+#
+# Purpose: measure whether a FREE GitHub-hosted runner (public repo: 4 vCPU,
+# 16 GB RAM, 14 GB SSD) can run Cassian Gate's FRR labs and its SONiC VM
+# (vrnetlab/KVM) legs. Runs in a SCRATCH public repo, never in cassian-gate or
+# cassian-gate-internal. Changes nothing in the product or its governance.
+#
+# Trigger: manual only (workflow_dispatch) — no pull_request, no push.
+# Every measurement is appended to /tmp/trial.txt and printed in the run
+# summary at the end, pass or fail.
+
+name: hosted-runner SONiC trial
+
+on:
+  workflow_dispatch:
+    inputs:
+      clab_version:
+        description: "containerlab version to pin (as on ai-netsim, e.g. 0.xx.y)"
+        required: true
+        type: string
+      sonic_image:
+        description: "SONiC vrnetlab image in GHCR"
+        required: true
+        default: "ghcr.io/cassian-gate/sonic-vm:202405"
+        type: string
+      local_tag:
+        description: "Local tag Gate's topologies resolve"
+        required: true
+        default: "local/sonic-vm:202405"
+        type: string
+      sonic_boots:
+        description: "How many SONiC boots (boot-time spread)"
+        required: true
+        default: "2"
+        type: string
+      boot_timeout_s:
+        description: "Seconds to wait for each SONiC boot"
+        required: true
+        default: "900"
+        type: string
+      free_disk:
+        description: "Remove preinstalled toolchains first (fallback if disk is short)"
+        required: true
+        default: false
+        type: boolean
+      run_gate:
+        description: "Also run Gate's VM assertion leg (validate/up/test/down)"
+        required: true
+        default: true
+        type: boolean
+      gate_ref:
+        description: "cassian-gate ref for the Gate leg"
+        required: true
+        default: "develop/phase2"
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  trial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CLAB_VERSION: ${{ inputs.clab_version }}
+      SONIC_IMAGE: ${{ inputs.sonic_image }}
+      LOCAL_TAG: ${{ inputs.local_tag }}
+      BOOTS: ${{ inputs.sonic_boots }}
+      TIMEOUT: ${{ inputs.boot_timeout_s }}
+
+    steps:
+      - name: 1. Runner baseline (CPU, RAM, disk, KVM device)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rec() { echo "$1: $2" | tee -a /tmp/trial.txt; }
+          rec "runner vCPU" "$(nproc)"
+          rec "runner RAM total" "$(free -g | awk '/^Mem:/{print $2}') GB"
+          rec "disk / free at start" "$(df -h / | awk 'NR==2{print $4}')"
+          rec "/dev/kvm present" "$(test -e /dev/kvm && echo yes || echo NO)"
+          rec "CPU virt flags (vmx/svm lines)" "$(grep -Ec '(vmx|svm)' /proc/cpuinfo || true)"
+          df -h
+
+      - name: 2. (optional) Free disk space
+        if: ${{ inputs.free_disk }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rec() { echo "$1: $2" | tee -a /tmp/trial.txt; }
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+          rec "disk / free after cleanup" "$(df -h / | awk 'NR==2{print $4}')"
+
+      - name: 3. Enable and check KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          rec() { echo "$1: $2" | tee -a /tmp/trial.txt; }
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cpu-checker
+          if sudo kvm-ok; then rec "kvm-ok" "yes"; else rec "kvm-ok" "NO"; fi
+
+      - name: 4. Install containerlab (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rec() { echo "$1: $2" | tee -a /tmp/trial.txt; }
+          sudo -E bash -c "$(curl -sL https://get.containerlab.dev)" -- -v "$CLAB_VERSION"
+          containerlab version
+          rec "containerlab installed" "$(containerlab version | awk '/version:/{print $2; exit}')"
+
+      - name: 5. Log in to GHCR (read-only)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 6. Pull the SONiC image and tag it locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          rec() { echo "$1: $2" | tee -a /tmp/trial.txt; }
+          t0=$(date +%s)
+          docker pull "$SONIC_IMAGE"
+          t1=$(date +%s)
+          docker tag "$SONIC_IMAGE" "$LOCAL_TAG"
+          rec "SONiC image pull" "$((t1 - t0)) s"
+          rec "SONiC image size" "$(docker image inspect -f '{{.Size}}' "$SONIC_IMAGE" | awk '{printf "%.2f GB", $1/1e9}')"
+          rec "disk / free after pull" "$(df -h / | awk 'NR==2{print $4}')"
+
+      - name: 7. FRR control lab (containerlab works at all?)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rec() { echo "$1: $2" | tee -a /tmp/trial.txt; }
+          cat > /tmp/frrctl.clab.yml <<'EOF'
+          name: frrctl
+          topology:
+            nodes:
+              r1:
+                kind: linux
+                image: quay.io/frrouting/frr:10.7.1
+              r2:
+                kind: linux
+                image: quay.io/frrouting/frr:10.7.1
+            links:
+              - endpoints: ["r1:eth1", "r2:eth1"]
+          EOF
+          t0=$(date +%s)
+          sudo containerlab deploy -t /tmp/frrctl.clab.yml --reconfigure
+          ok=no
+          for _ in $(seq 1 15); do
+            if docker exec clab-frrctl-r1 vtysh -c "show version" >/tmp/frr_ver.txt 2>&1; then ok=yes; break; fi
+            sleep 2
+          done
+          t1=$(date +%s)
+          head -n 3 /tmp/frr_ver.txt || true
+          rec "FRR control lab" "vtysh answered=$ok, $((t1 - t0)) s from deploy"
+          sudo containerlab destroy -t /tmp/frrctl.clab.yml --cleanup
+          test "$ok" = yes
+
+      - name: 8. SONiC VM boots (KVM accel, boot time, RAM, disk)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rec() { echo "$1: $2" | tee -a /tmp/trial.txt; }
+          cat > /tmp/sonictrial.clab.yml <<EOF
+          name: sonictrial
+          topology:
+            nodes:
+              s1:
+                kind: sonic-vm
+                image: ${LOCAL_TAG}
+          EOF
+          all_ready=yes
+          for i in $(seq 1 "$BOOTS"); do
+            t0=$(date +%s)
+            sudo containerlab deploy -t /tmp/sonictrial.clab.yml --reconfigure
+            ready=no
+            while [ $(( $(date +%s) - t0 )) -lt "$TIMEOUT" ]; do
+              h=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' clab-sonictrial-s1 2>/dev/null || echo gone)
+              if [ "$h" = "healthy" ] || docker logs clab-sonictrial-s1 2>&1 | grep -q "Startup complete"; then
+                ready=yes; break
+              fi
+              sleep 10
+            done
+            t1=$(date +%s)
+            accel=$(pgrep -af 'qemu-system' | head -n1 | grep -Eo 'enable-kvm|accel=kvm|accel=tcg' | head -n1 || true)
+            rec "SONiC boot $i" "ready=$ready in $((t1 - t0)) s, health=$h, qemu accel=${accel:-not seen}"
+            rec "RAM used at boot $i" "$(free -g | awk '/^Mem:/{print $3}') GB of $(free -g | awk '/^Mem:/{print $2}') GB"
+            rec "disk / free at boot $i" "$(df -h / | awk 'NR==2{print $4}')"
+            if [ "$ready" != yes ]; then
+              all_ready=no
+              docker logs --tail 80 clab-sonictrial-s1 || true
+            fi
+            sudo containerlab destroy -t /tmp/sonictrial.clab.yml --cleanup
+          done
+          test "$all_ready" = yes
+
+      - name: 9a. (Gate leg) Check out cassian-gate
+        if: ${{ !cancelled() && inputs.run_gate }}
+        uses: actions/checkout@v4
+        with:
+          repository: cassian-gate/cassian-gate
+          ref: ${{ inputs.gate_ref }}
+          path: cg
+
+      - name: 9b. (Gate leg) Python 3.11
+        if: ${{ !cancelled() && inputs.run_gate }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 9c. (Gate leg) VM assertion leg — validate/up/test/down
+        if: ${{ !cancelled() && inputs.run_gate }}
+        shell: bash
+        working-directory: cg
+        run: |
+          set -euo pipefail
+          rec() { echo "$1: $2" | tee -a /tmp/trial.txt; }
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; else python -m pip install .; fi
+          # containerlab needs root on this runner; keep the setup-python
+          # interpreter on PATH under sudo.
+          G() { sudo -E env "PATH=$PATH" "$@"; }
+          t0=$(date +%s)
+          rc=0
+          G ./src/cassian.py validate topologies/vm-assertion-smoke.yaml || rc=$?
+          if [ "$rc" -eq 0 ]; then G ./src/cassian.py up topologies/vm-assertion-smoke.yaml --reconfigure || rc=$?; fi
+          if [ "$rc" -eq 0 ]; then G ./src/cassian.py test vm-assertion-smoke || rc=$?; fi
+          G ./src/cassian.py down vm-assertion-smoke || true
+          t1=$(date +%s)
+          rec "Gate VM assertion leg" "rc=$rc in $((t1 - t0)) s"
+          exit "$rc"
+
+      - name: Teardown (any lab left behind)
+        if: always()
+        shell: bash
+        run: sudo containerlab destroy --all --cleanup || true
+
+      - name: Trial summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Hosted-runner SONiC trial"
+            echo
+            echo '```'
+            cat /tmp/trial.txt 2>/dev/null || echo "no records written"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/trial.txt 2>/dev/null || true
